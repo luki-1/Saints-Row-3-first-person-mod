@@ -3,6 +3,8 @@
 A first-person camera for **Saints Row: The Third** (original 2011 PC release, DX9 and DX11), plus a
 level-of-detail distance multiplier. Press **L** in game to switch between first and third person.
 
+https://www.youtube.com/watch?v=_ErMo5DBjGA
+
 ## Install / uninstall
 
 Double-click `install.bat` in the `MOD` folder. It finds the game (the folder `MOD` is in, or your Steam
