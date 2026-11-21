@@ -31,8 +31,10 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <intrin.h>
 #include <ctype.h>
 #include <math.h>
+#include <float.h>
 #include <share.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -40,13 +42,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MOD_VERSION "1.3"
+#define MOD_VERSION "1.11"
 
 static const float kPi = 3.14159265f;
 static const float kTwoPi = 6.28318531f;
 static const float kDegToRad = 0.017453292f;
 static const float kRadToDeg = 57.29578f;
-static const float kMinNearClip = 0.15f;  // the game's own lower limit for the near clip distance
+static const float kMinNearClip = 0.02f;  // 2 cm; only applied to the first-person view
 
 // --------------------------------------------------------------------------------------------------
 // Log and settings
@@ -78,9 +80,12 @@ struct Config
     bool vehicleAutoCenter; // keep the game's swing back behind the vehicle in first person
     float eyeHeight;       // look-at height above the feet while standing (m); fallback for the head
     float crouchEyeHeight;  // ... while crouching
+    bool faceCamera;        // on-foot body yaw follows the first-person view
+    bool hideHead;          // hide local head geometry in first person, without changing the outfit
     bool attachToHead;      // follow the animated head instead of a fixed point
     float headUp;           // eye offset from the head tag (m)
     float headForward;      // ... along the horizontal view direction
+    float lookDownForward;  // extra horizontal clearance when looking down on foot (m)
     float headSmoothing;    // seconds; damps head bob, 0 = off
     float fov;              // degrees; 0 keeps the game's value
     float sprintFov;
@@ -147,9 +152,18 @@ static void LoadConfig()
     g_cfg.vehicleAutoCenter = IniInt(ini, "VehicleAutoCenter", 0) != 0;
     g_cfg.eyeHeight = IniFloat(ini, "EyeHeight", 1.60f);
     g_cfg.crouchEyeHeight = IniFloat(ini, "CrouchEyeHeight", 1.30f);
+    g_cfg.faceCamera = IniInt(ini, "FaceCamera", 1) != 0;
+    g_cfg.hideHead = IniInt(ini, "HideHead", 1) != 0;
     g_cfg.attachToHead = IniInt(ini, "AttachToHead", 1) != 0;
     g_cfg.headUp = IniFloat(ini, "HeadUp", 0.08f);
-    g_cfg.headForward = IniFloat(ini, "HeadForward", 0.10f);
+    g_cfg.headForward = IniFloat(ini, "HeadForward", 0.02f);
+    g_cfg.lookDownForward = IniFloat(ini, "LookDownForward", 0.20f);
+    if (!_finite(g_cfg.lookDownForward))
+        g_cfg.lookDownForward = 0.20f;
+    if (g_cfg.lookDownForward < 0.0f)
+        g_cfg.lookDownForward = 0.0f;
+    if (g_cfg.lookDownForward > 0.40f)
+        g_cfg.lookDownForward = 0.40f;
     g_cfg.headSmoothing = IniFloat(ini, "HeadSmoothing", 0.08f);
     g_cfg.fov = IniFloat(ini, "FOV", 82.8f);
     g_cfg.sprintFov = IniFloat(ini, "SprintFOV", 91.08f);
@@ -157,7 +171,11 @@ static void LoadConfig()
     g_cfg.vehicleFov = IniFloat(ini, "VehicleFOV", 82.8f);
     g_cfg.lookUpLimit = IniFloat(ini, "LookUpLimit", 80.0f);
     g_cfg.lookDownLimit = IniFloat(ini, "LookDownLimit", 80.0f);
-    g_cfg.nearClip = IniFloat(ini, "NearClip", 0.15f);
+    g_cfg.nearClip = IniFloat(ini, "NearClip", 0.03f);
+    if (!_finite(g_cfg.nearClip) || g_cfg.nearClip < 0.0f)
+        g_cfg.nearClip = 0.03f;
+    if (g_cfg.nearClip > 1.0f)
+        g_cfg.nearClip = 1.0f;
     if (g_cfg.nearClip > 0.0f && g_cfg.nearClip < kMinNearClip)
         g_cfg.nearClip = kMinNearClip;
     g_cfg.lodScale = IniFloat(ini, "LODScale", 4.0f);
@@ -299,6 +317,17 @@ static const int kTypeInfoFlags6 = 0x06;    // byte in the type info; 0x80 = veh
 static const char* kSigVehicleLock = "80 7C 24 13 00 0F 84 ?? ?? ?? ?? F3 0F 10 47 04 F3 0F 10 57 10 F3 0F 10 5F 24";
 static const size_t kVehicleLockPatch = 11;
 
+// Aircraft mode-change look request inside the free-camera update. Redirect only this
+// call, not the shared forced-look function used by scripted cameras elsewhere.
+static const char* kSigVehicleTransitionLook =
+    "8B 4B 0C 8B 53 08 50 51 52 E8 ?? ?? ?? ?? 83 C4 0C EB 7B 83 3D";
+
+// Vehicle look-input callback: mouse-flight option / aircraft-flight predicate / early return.
+// The second call (at +10) suppresses BOTH camera axes for planes and a VTOL in flight mode.
+// Redirect just this predicate call; flight physics and every other aircraft test stay native.
+static const char* kSigAircraftLookInputGate =
+    "E8 ?? ?? ?? ?? 84 C0 74 11 56 E8 ?? ?? ?? ?? 83 C4 04 84 C0 0F 85 8A 00 00 00 57 E8";
+
 // End of the orbit update: [offset] = heading - yaw of the camera target, computed with
 // get_target_matrix (esi = 16-byte aligned out matrix, handle lo, hi; caller pops) at +24 and
 // matrix_angles (thiscall(matrix, vec4* out); yaw in out[0]) at +34. The heading address is at +46.
@@ -355,6 +384,37 @@ static const int kMaxLods = 16;
 // items_3d.xtbl LODs: parse_float(&item->lod_distance[i], node, 0) inside the item parser.
 static const char* kSigItemLodParse = "8B 86 94 00 00 00 6A 00 8D 8C 86 98 00 00 00 40 57 51 89 86 94 00 00 00 E8";
 static const size_t kItemLodParseCallOffset = 24;
+
+// Player customization render-instance update, cdecl(player, position, orientation, outfit, visible).
+// Its first six bytes are complete, position-independent stack-frame instructions.
+static const char* kSigOutfitUpdate =
+    "55 8B EC 83 E4 F0 83 EC 64 A1 ?? ?? ?? ?? 33 C4 89 44 24 60 8B 45 0C 53 56 8B 75 14 57 "
+    "89 44 24 1C 89 74 24 18 85 F6 0F 84 6E 04 00 00 8B 46 20 85 C0 0F 84 63 04 00 00 "
+    "8B 48 10 85 C9 0F 84 58 04 00 00";
+static const char* kSigVidIndex =
+    "53 8B 5C 24 08 8B 43 78 57 85 C0 74 1F 8B 7B 70 33 C9 85 FF 76 16 8B 54 24 10 8D 9B 00 00 00 00 39 10 74 0E 41 83 C0 04";
+// Native locomotion: select view-relative facing and directional animation flags together.
+// Patch only these two predicate call sites, not the predicate's other gameplay users.
+static const char* kSigFacingOffsetCall =
+    "56 E8 ?? ?? ?? ?? 83 C4 04 84 C0 0F 84 A8 00 00 00 0F 28 86 50 0A 00 00 8D BE 50 0A 00 00";
+static const char* kSigFacingTurnCall =
+    "56 E8 ?? ?? ?? ?? 83 C4 04 84 C0 74 31 F3 0F 10 4C 24 18 0F 57 D2 0F 2F CA F3 0F 10 44 24 14";
+static const char* kSigStrafeGate =
+    "80 7C 24 1A 00 75 0B 80 7C 24 19 00 0F 84 ?? ?? ?? ?? 8D 4C 24 34 E8 ?? ?? ?? ?? 84 C0 0F 85 ?? ?? ?? ?? 38 44 24 19";
+// DX9 rl_d3d_shadow_render_pass / DX11 rl_pc_shadow_render_pass::render.
+// Explicit scope is essential: non-shadow depth/material draws can also use flags & 2.
+static const char* kSigShadowPass =
+    "51 53 55 56 57 8B F1 56 E8 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 8A 81 60 CE 00 00 8B 56 10 64 8B 1D 2C 00 00 00 8B 6C 24 1C 88 44 24 13";
+
+static const char* kSigDrawPart =
+    "83 EC 14 57 8B F9 8B 4C 24 24 8B C1 83 E0 05 89 44 24 0C 83 F8 05";
+// rl_skin_instance's alpha-sort path reads the active render view's world origin at +0x28.
+static const char* kSigRenderView =
+    "64 8B 0D 2C 00 00 00 A1 ?? ?? ?? ?? 8B 14 81 8B 8A ?? ?? 00 00 85 C9 75 04 33 C0 EB 05 E8 ?? ?? ?? ?? F3 0F 10 40 28 F3 0F 10 5B 28";
+
+// The free-camera update is entry 0; other modes include cinematic cameras.
+static const char* kSigCameraDispatch =
+    "A1 ?? ?? ?? ?? 8D 04 80 8B 04 85 ?? ?? ?? ?? 3B C7 74 0D D9 44 24 1C 51 D9 1C 24";
 
 // --------------------------------------------------------------------------------------------------
 // Scanning and patching
@@ -622,6 +682,7 @@ static float g_gameNearClip;  // the game's value while ours is applied
 static bool g_nearApplied;
 
 static uint8_t* g_ctrl;           // submode controller, remembered from its update
+static const int* g_cameraMode;  // outer camera mode; 0 = gameplay free camera
 static float* g_camPos;           // camera position; orientation rows follow
 static uint8_t* const* g_player;  // the local player object
 static void* g_getTagPos;
@@ -630,6 +691,19 @@ static bool g_headTracked;
 static bool g_headMissingLogged;
 static float g_lastHeadHeight;    // for the debug log
 static float g_lastHeadWeight;
+static float g_firstPersonEye[3];
+static bool g_firstPersonEyeValid;
+static const uint8_t* g_eyePlayer;
+static int g_eyeSubmode = -1;
+static float g_previousVehicleEye[3];
+static bool g_previousVehicleEyeValid;
+static volatile LONG g_cameraFrame;
+static volatile LONG g_seenEyeFrame = -1;
+typedef bool(__cdecl* FacingPredicateFn)(uint8_t*);
+static FacingPredicateFn g_origFacingPredicate;
+static void* g_strafeTrampoline;
+static bool g_nativeFacingReady;
+static bool g_facingFailed;
 static int g_lastSubmode = -1;    // to know which submode a blend started from
 static int g_blendFrom = -1;
 
@@ -735,6 +809,24 @@ static void WriteController(uint8_t* ctrl, const float (*values)[F_COUNT])
         WriteBlock(ctrl + kCtrlBlocks[b], values[m], g_mask[m]);
 }
 
+static void RefreshVehiclePitchLimits(uint8_t* ctrl)
+{
+    if (!g_active || g_failed || !g_cfg.vehicles || !g_cameraMode || *g_cameraMode != 0 || !ctrl)
+        return;
+    int cur = *(int*)(ctrl + kCtrlSubmode);
+    if (cur < 0 || cur >= kNumSubmodes || g_modeOf[cur] < 0) return;
+    int m = g_modeOf[cur];
+    if (kModes[m].cat != CAT_VEHICLE) return;
+    // A hover/flight switch can repopulate the table and cached blend blocks inside
+    // the original controller update. Capture those native values before reapplying.
+    EnforceTable();
+    unsigned mask = 0;
+    if (g_cfg.lookUpLimit > 0.0f) mask |= 1u << F_MIN_PITCH;
+    if (g_cfg.lookDownLimit > 0.0f) mask |= 1u << F_MAX_PITCH;
+    for (int b = 0; b < 3; b++)
+        WriteBlock(ctrl + kCtrlBlocks[b], g_fp[m], mask);
+}
+
 static bool TogglePressed()
 {
     bool down = (GetAsyncKeyState(g_cfg.toggleKey) & 0x8000) != 0;
@@ -766,7 +858,7 @@ static void DebugDump(uint8_t* ctrl)
 }
 
 // The near clip is one global that the game sets on level load and around special cameras. While the
-// camera is in first person use ours (unless the game's is already further out); hand it back after.
+// camera is in first person use ours, including values below the vanilla 0.15 m; hand it back after.
 static void UpdateNearClip(bool firstPersonView)
 {
     if (g_cfg.nearClip <= 0.0f)
@@ -774,7 +866,7 @@ static void UpdateNearClip(bool firstPersonView)
     float cur = *g_nearClip;
     if (firstPersonView)
     {
-        if (cur < g_cfg.nearClip)
+        if (!g_nearApplied || cur != g_cfg.nearClip)
         {
             g_gameNearClip = cur;
             *g_nearClip = g_cfg.nearClip;
@@ -796,7 +888,31 @@ static bool IsFirstPersonSubmode(int submode)
 
 static bool InFirstPersonView(uint8_t* ctrl)
 {
-    return g_active && ctrl && IsFirstPersonSubmode(*(int*)(ctrl + kCtrlSubmode));
+    return g_active && !g_failed && g_cameraMode && *g_cameraMode == 0 && ctrl &&
+           IsFirstPersonSubmode(*(int*)(ctrl + kCtrlSubmode));
+}
+
+// Render work can still refer to the preceding camera update. At vehicle speeds that
+// eye can be metres away from the latest one, outside the small camera-shake tolerance.
+// Keep exactly one previous sample, only across consecutive updates in the same seat
+// camera. Never widen the radius or accept arbitrary positions along the motion path.
+static void BeginEyeFrame(float dt)
+{
+    g_previousVehicleEyeValid = g_firstPersonEyeValid && dt > 0.0f && dt <= 0.1f &&
+        InFirstPersonView(g_ctrl) && g_player && *g_player == g_eyePlayer &&
+        *(int*)(g_ctrl + kCtrlSubmode) == g_eyeSubmode &&
+        IsVehicleCategory(kModes[g_modeOf[g_eyeSubmode]].cat);
+    if (g_previousVehicleEyeValid)
+        memcpy(g_previousVehicleEye, g_firstPersonEye, sizeof g_previousVehicleEye);
+    g_firstPersonEyeValid = false;
+}
+
+static void PublishEye(const float* eye, const uint8_t* player)
+{
+    memcpy(g_firstPersonEye, eye, sizeof g_firstPersonEye);
+    g_eyePlayer = player;
+    g_eyeSubmode = *(int*)(g_ctrl + kCtrlSubmode);
+    g_firstPersonEyeValid = true;
 }
 
 static void Tick(uint8_t* ctrl)
@@ -893,10 +1009,33 @@ static float HeadWeight(uint8_t* ctrl)
     return to ? eased : 1.0f - eased;
 }
 
+// Extra horizontal eye clearance keeps the open neck behind the camera when looking down.
+// Use the final view direction (Y up), not head animation or controller pitch. Smoothstep has
+// zero slope at both ends, so crossing either threshold does not produce a sudden camera jump.
+static float LookDownClearance(const float* forward)
+{
+    if (!g_cfg.hideHead || !InFirstPersonView(g_ctrl) || g_cfg.lookDownForward <= 0.0f)
+        return 0.0f;
+    int submode = *(const int*)(g_ctrl + kCtrlSubmode);
+    if (IsVehicleCategory(kModes[g_modeOf[submode]].cat))
+        return 0.0f;
+    float horizontal = sqrtf(forward[0] * forward[0] + forward[2] * forward[2]);
+    if (!_finite(horizontal) || !_finite(forward[1]) ||
+        (horizontal < 1e-6f && fabsf(forward[1]) < 1e-6f))
+        return 0.0f;
+    float downDegrees = atan2f(-forward[1], horizontal) * kRadToDeg;
+    float t = (downDegrees - 45.0f) / 30.0f;
+    if (t <= 0.0f)
+        return 0.0f;
+    if (t >= 1.0f)
+        return g_cfg.lookDownForward;
+    return g_cfg.lookDownForward * t * t * (3.0f - 2.0f * t);
+}
+
 // Moves the camera computed by the game to the player's eyes.
 static void AttachToHead(float dt)
 {
-    float weight = (g_active && g_ctrl) ? HeadWeight(g_ctrl) : 0.0f;
+    float weight = (g_active && g_ctrl && g_cameraMode && *g_cameraMode == 0) ? HeadWeight(g_ctrl) : 0.0f;
     g_lastHeadWeight = weight;
     if (weight <= 0.0f)
     {
@@ -945,12 +1084,25 @@ static void AttachToHead(float dt)
         fz /= flen;
     }
     else
-        fx = fz = 0.0f;
+    {
+        // At exactly vertical pitch, use the right row to retain a stable horizontal heading.
+        const float* right = g_camPos + 0x40 / 4;
+        fx = -right[2];
+        fz = right[0];
+        float length = sqrtf(fx * fx + fz * fz);
+        if (length > 1e-3f) { fx /= length; fz /= length; }
+        else fx = fz = 0.0f;
+    }
+    float forwardOffset = g_cfg.headForward + LookDownClearance(fwd);
 
-    float eye[3] = {feet[0] + g_headOffset[0] + fx * g_cfg.headForward, feet[1] + g_headOffset[1] + g_cfg.headUp,
-                    feet[2] + g_headOffset[2] + fz * g_cfg.headForward};
+    float eye[3] = {feet[0] + g_headOffset[0] + fx * forwardOffset, feet[1] + g_headOffset[1] + g_cfg.headUp,
+                    feet[2] + g_headOffset[2] + fz * forwardOffset};
     for (int i = 0; i < 3; i++)
         g_camPos[i] += (eye[i] - g_camPos[i]) * weight;
+    if (weight >= 0.999f && InFirstPersonView(g_ctrl))
+    {
+        PublishEye(eye, player);
+    }
 }
 
 static void SafeTick(uint8_t* ctrl)
@@ -987,10 +1139,50 @@ static void* g_origSwing;
 static void* g_lockDriving;            // original code after the "player drives" test
 static void* g_lockNotDriving;         // ... and its branch for "not driving"
 static bool g_vehYawValid;
+typedef void(__cdecl* VehicleTransitionLookFn)(uint32_t, uint32_t, const void*);
+static VehicleTransitionLookFn g_origVehicleTransitionLook;
+typedef bool(__cdecl* AircraftLookInputGateFn)(const uint8_t*);
+static AircraftLookInputGateFn g_origAircraftLookInputGate;
+static bool g_aircraftInputFailed;
+static volatile LONG g_loggedAircraftInput;
 static float g_vehYaw;                 // target yaw last frame
 static uint32_t g_vehHandle[2];        // ... and which target that was
 static __declspec(align(16)) float g_targetMatrix[12];
 static __declspec(align(16)) float g_targetAngles[4];
+
+static void __cdecl Hook_VehicleTransitionLook(uint32_t lo, uint32_t hi, const void* settings)
+{
+    if (g_vehLook && InFirstPersonView(g_ctrl) && g_camTarget &&
+        lo == g_camTarget[0] && hi == g_camTarget[1] &&
+        kModes[g_modeOf[*(int*)(g_ctrl + kCtrlSubmode)]].cat == CAT_VEHICLE)
+        return;
+    g_origVehicleTransitionLook(lo, hi, settings);
+}
+
+static bool __cdecl Hook_AircraftLookInputGate(const uint8_t* vehicle)
+{
+    bool blocked = g_origAircraftLookInputGate(vehicle);
+    if (!blocked || g_aircraftInputFailed) return blocked;
+    __try
+    {
+        if (g_vehLook && !g_cfg.vehicleAutoCenter && g_cfg.vehicles &&
+            InFirstPersonView(g_ctrl) && g_camTarget && vehicle && g_player && *g_player &&
+            kModes[g_modeOf[*(int*)(g_ctrl + kCtrlSubmode)]].cat == CAT_VEHICLE &&
+            *(const uint32_t*)(vehicle + kObjectHandle) == g_camTarget[0] &&
+            *(const uint32_t*)(vehicle + kObjectHandle + 4) == g_camTarget[1])
+        {
+            if (!InterlockedCompareExchange(&g_loggedAircraftInput, 1, 0))
+                Log("aircraft flight-mode camera input unlocked in first person");
+            return false;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_aircraftInputFailed = true;
+        Log("ERROR: aircraft input gate exception; native input routing retained");
+    }
+    return blocked;
+}
 
 static bool IsVehicle(uint32_t lo, uint32_t hi)
 {
@@ -1122,6 +1314,15 @@ static void __fastcall Hook_CtrlUpdate(void* ctrl, void* /*edx*/, float dt)
     if (!g_failed)
         SafeTick((uint8_t*)ctrl);
     g_origCtrlUpdate(ctrl, dt);
+    if (!g_failed)
+    {
+        __try { RefreshVehiclePitchLimits((uint8_t*)ctrl); }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_failed = true;
+            Log("ERROR: exception 0x%08lX refreshing vehicle pitch limits", GetExceptionCode());
+        }
+    }
     if (g_vehLookReady && !g_failed)
         SafeVehicleLook();
     else
@@ -1142,11 +1343,353 @@ static void SafeAttachToHead(float dt)
     }
 }
 
+static bool NormalOnFootView()
+{
+    if (!InFirstPersonView(g_ctrl)) return false;
+    switch (*(const int*)(g_ctrl + kCtrlSubmode))
+    {
+    case 0: case 1: case 2: case 20: case 21: case 22: case 31: case 32: case 33:
+        return true;
+    default: return false; // scripted, melee, traversal, falling and vehicle animations own their pose
+    }
+}
+
+static bool ShouldFaceCamera(uint8_t* player)
+{
+    __try
+    {
+        if (!g_nativeFacingReady || !g_cfg.faceCamera || g_facingFailed || !NormalOnFootView() ||
+            !g_firstPersonEyeValid || g_seenEyeFrame != g_cameraFrame || !g_player ||
+            !player || player != *g_player || player != g_eyePlayer) return false;
+        // A tilted/ragdoll pose must remain owned by the game. Compare positive IEEE float bits
+        // here so this gate never introduces a floating-point operation into the animation hook.
+        uint32_t up = *(const uint32_t*)(player + 0x5C);
+        return up >= 0x3F733333 && up <= 0x3F866666 && !(player[kObjFlags] & 0x10);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_facingFailed = true;
+        Log("ERROR: locomotion gate exception 0x%08lX; normal movement retained", GetExceptionCode());
+        return false;
+    }
+}
+
+static bool __cdecl Hook_FacingPredicate(uint8_t* player)
+{
+    return ShouldFaceCamera(player) || g_origFacingPredicate(player);
+}
+
+static void __cdecl EnableDirectionalAnimations(uint8_t* player, uint8_t* allowStrafe)
+{
+    if (ShouldFaceCamera(player)) *allowStrafe = 1;
+}
+
+// Entry is a five-byte cmp [esp+1Ah],0 in the directional-animation selector; ebx is the
+// character. Preserve live flags, GPRs and SSE registers and let the original selector do the
+// angle thresholds, hysteresis and walk/run/crouch choice. Movement inputs and speed stay native.
+static __declspec(naked) void Hook_StrafeGate()
+{
+    __asm {
+        pushfd
+        pushad
+        sub esp, 128
+        movdqu [esp], xmm0
+        movdqu [esp+16], xmm1
+        movdqu [esp+32], xmm2
+        movdqu [esp+48], xmm3
+        movdqu [esp+64], xmm4
+        movdqu [esp+80], xmm5
+        movdqu [esp+96], xmm6
+        movdqu [esp+112], xmm7
+        lea eax, [esp+190]
+        push eax
+        push ebx
+        call EnableDirectionalAnimations
+        add esp, 8
+        movdqu xmm0, [esp]
+        movdqu xmm1, [esp+16]
+        movdqu xmm2, [esp+32]
+        movdqu xmm3, [esp+48]
+        movdqu xmm4, [esp+64]
+        movdqu xmm5, [esp+80]
+        movdqu xmm6, [esp+96]
+        movdqu xmm7, [esp+112]
+        add esp, 128
+        popad
+        popfd
+        jmp dword ptr [g_strafeTrampoline]
+    }
+}
+
+static void InitFacing()
+{
+    if (!g_cfg.faceCamera) return;
+    uint8_t* offset = Find("native view-facing offset", kSigFacingOffsetCall);
+    uint8_t* turn = Find("native view-facing turn", kSigFacingTurnCall);
+    uint8_t* strafe = Find("directional animation gate", kSigStrafeGate);
+    if (!offset || !turn || !strafe || CallTarget(offset+1) != CallTarget(turn+1))
+    {
+        Log("ERROR: native camera facing unavailable; original locomotion retained");
+        return;
+    }
+    g_origFacingPredicate = (FacingPredicateFn)CallTarget(offset+1);
+    g_strafeTrampoline = Detour(strafe, (const void*)&Hook_StrafeGate, 5);
+    if (g_strafeTrampoline && RedirectCall(offset+1, (const void*)&Hook_FacingPredicate) &&
+        RedirectCall(turn+1, (const void*)&Hook_FacingPredicate)) g_nativeFacingReady = true;
+    Log("body facing: %s", g_nativeFacingReady ? "native view-relative locomotion and directional animations enabled" : "original locomotion retained");
+}
+
 static void __cdecl Hook_CameraUpdate(float dt)
 {
     g_origCameraUpdate(dt);
+    InterlockedIncrement(&g_cameraFrame);
+    BeginEyeFrame(dt);
     if (g_active && !g_failed && g_cfg.attachToHead)
         SafeAttachToHead(dt);
+    else if (!g_cfg.attachToHead && InFirstPersonView(g_ctrl) && g_player && *g_player &&
+             HeadWeight(g_ctrl) >= 0.999f)
+    {
+        PublishEye(g_camPos, *g_player);
+    }
+    // The game can reset its projection settings during camera computation.
+    UpdateNearClip(InFirstPersonView(g_ctrl));
+}
+
+// --------------------------------------------------------------------------------------------------
+// First-person head visibility
+// --------------------------------------------------------------------------------------------------
+
+// Keep the game's complete render instances, including their shadow-caster lists. Only skip
+// matching head parts at draw time, in the eye view. No persistent visibility/part-list mutations.
+typedef void(__cdecl* OutfitUpdateFn)(uint8_t*, const void*, const void*, uint8_t*, int);
+typedef int(__cdecl* VidIndexFn)(void*, int, int);
+typedef void(__thiscall* DrawPartFn)(void*, int, int, int);
+static OutfitUpdateFn g_origOutfitUpdate;
+static VidIndexFn g_vidIndex;
+static DrawPartFn g_origDrawPart;
+typedef void(__thiscall* ShadowPassFn)(void*, void*, unsigned);
+static ShadowPassFn g_origShadowPass;
+static __declspec(thread) unsigned g_shadowDepth;
+static volatile LONG g_loggedHeadDraw, g_loggedHeadShadow;
+static volatile LONG g_vehicleHeadLogTime;
+
+static void __fastcall Hook_ShadowPass(void* pass, void*, void* context, unsigned mask)
+{
+    g_shadowDepth++;
+    __try { g_origShadowPass(pass, context, mask); }
+    __finally { g_shadowDepth--; }
+}
+static const DWORD* g_renderTlsIndex;
+static size_t g_renderContextOffset;
+static bool g_headHideFailed;
+static SRWLOCK g_headLock = SRWLOCK_INIT;
+struct HeadInstance
+{
+    uint8_t* instance;
+    void* renderMesh;
+    bool whole;
+    int parts[5];
+};
+static HeadInstance g_headInstances[128];
+static int g_headInstanceCount;
+static const uint8_t* g_outfitPlayer;
+
+static bool HeadSlot(int slot)
+{
+    return (slot >= 1 && slot <= 8) || slot == 18 || slot == 20;
+}
+
+static void CacheLocalHead(uint8_t* outfit, const uint8_t* player)
+{
+    HeadInstance entries[128];
+    int count = 0;
+    uint8_t* first = outfit ? *(uint8_t**)outfit : NULL;
+    uint8_t* node = first;
+    for (int n = 0; node && n < 128; n++)
+    {
+        const uint8_t* definition = *(uint8_t**)node;
+        uint8_t* loaded = *(uint8_t**)(node + 8);
+        if (definition && loaded && node[4] == 0)
+        {
+            int slot = *(const int*)(definition + 0x2C);
+            uint8_t* instance = *(uint8_t**)(loaded + 0x50);
+            if (instance && (HeadSlot(slot) || slot == 0))
+            {
+                HeadInstance& entry = entries[count++];
+                entry.instance = instance;
+                entry.renderMesh = *(void**)(instance + 0xBC);
+                entry.whole = HeadSlot(slot);
+                for (int j = 0; j < 5; j++) entry.parts[j] = -1;
+                uint8_t* selector = *(uint8_t**)(loaded + 0x4C);
+                if (!entry.whole && selector)
+                {
+                    static const int headVids[] = {1, 50, 51, 52, 53};
+                    void* mesh = *(void**)selector;
+                    int lod = *(const int16_t*)(selector + 0x1C);
+                    if (mesh && lod >= 0)
+                        for (int j = 0; j < 5; j++)
+                            entry.parts[j] = g_vidIndex(mesh, headVids[j], lod);
+                }
+            }
+        }
+        node = *(uint8_t**)(node + 0x10);
+        if (node == first) break;
+    }
+    AcquireSRWLockExclusive(&g_headLock);
+    memcpy(g_headInstances, entries, count * sizeof entries[0]);
+    g_headInstanceCount = count;
+    g_outfitPlayer = player;
+    ReleaseSRWLockExclusive(&g_headLock);
+}
+
+static bool IsCachedHeadPart(uint8_t* instance, int part)
+{
+    bool hide = false;
+    // No game calls or potentially faulting instance reads while holding the lock.
+    void* mesh = *(void**)(instance + 0xBC);
+    AcquireSRWLockShared(&g_headLock);
+    if (g_outfitPlayer == g_eyePlayer)
+        for (int i = 0; i < g_headInstanceCount; i++)
+        {
+            const HeadInstance& entry = g_headInstances[i];
+            if (entry.instance != instance || entry.renderMesh != mesh) continue;
+            hide = entry.whole;
+            for (int j = 0; j < 5; j++)
+                if (entry.parts[j] >= 0 && entry.parts[j] == part) hide = true;
+            break;
+        }
+    ReleaseSRWLockShared(&g_headLock);
+    return hide;
+}
+
+static float EyeDistanceSquared(const float* position, const float* eye)
+{
+    float d2 = 0.0f;
+    for (int i = 0; i < 3; i++)
+    {
+        float d = position[i] - eye[i];
+        d2 += d * d;
+    }
+    return d2;
+}
+
+static bool AtFirstPersonEye(const float* position)
+{
+    if (!position || !g_firstPersonEyeValid || !InFirstPersonView(g_ctrl) ||
+        !g_player || !*g_player || *g_player != g_eyePlayer) return false;
+    float d2 = EyeDistanceSquared(position, g_firstPersonEye);
+    if (_finite(d2) && d2 <= 0.15f * 0.15f) return true;
+    int submode = *(int*)(g_ctrl + kCtrlSubmode);
+    if (!g_previousVehicleEyeValid || submode != g_eyeSubmode ||
+        !IsVehicleCategory(kModes[g_modeOf[submode]].cat)) return false;
+    d2 = EyeDistanceSquared(position, g_previousVehicleEye);
+    return _finite(d2) && d2 <= 0.15f * 0.15f;
+}
+
+static const float* RenderViewPosition()
+{
+    if (!g_renderTlsIndex) return NULL;
+    uint8_t** tls = (uint8_t**)__readfsdword(0x2C);
+    uint8_t* data = tls ? tls[*g_renderTlsIndex] : NULL;
+    uint8_t* context = data ? *(uint8_t**)(data + g_renderContextOffset) : NULL;
+    uint8_t* view = context ? *(uint8_t**)(context + 0x10) : NULL;
+    return view ? (const float*)(view + 0x28) : NULL;
+}
+
+static bool SuppressHeadPart(uint8_t* instance, int part, const float* eye)
+{
+    return g_cfg.hideHead && !g_headHideFailed && g_shadowDepth == 0 &&
+           AtFirstPersonEye(eye) && IsCachedHeadPart(instance, part);
+}
+
+static void DebugVehicleHeadView(uint8_t* instance, int part, const float* eye, bool hidden)
+{
+    if (!g_cfg.debug || !eye || !InFirstPersonView(g_ctrl) ||
+        !IsVehicleCategory(kModes[g_modeOf[*(int*)(g_ctrl + kCtrlSubmode)]].cat) ||
+        !IsCachedHeadPart(instance, part)) return;
+    LONG previous = g_vehicleHeadLogTime;
+    LONG now = (LONG)GetTickCount();
+    if ((DWORD)now - (DWORD)previous < 1000 ||
+        InterlockedCompareExchange(&g_vehicleHeadLogTime, now, previous) != previous) return;
+    Log("  vehicle head: hidden=%d, eye valid=%d, render distance=%.3f m, previous valid=%d distance=%.3f m",
+        hidden ? 1 : 0, g_firstPersonEyeValid ? 1 : 0,
+        sqrtf(EyeDistanceSquared(eye, g_firstPersonEye)), g_previousVehicleEyeValid ? 1 : 0,
+        sqrtf(EyeDistanceSquared(eye, g_previousVehicleEye)));
+}
+
+static void __fastcall Hook_DrawPart(uint8_t* instance, void*, int part, int pass, int flags)
+{
+    bool hide = false;
+    __try
+    {
+        if (!g_headHideFailed && g_active)
+        {
+            if (g_shadowDepth == 0)
+            {
+                const float* eye = RenderViewPosition();
+                if (AtFirstPersonEye(eye)) InterlockedExchange(&g_seenEyeFrame, g_cameraFrame);
+                hide = SuppressHeadPart(instance, part, eye);
+                DebugVehicleHeadView(instance, part, eye, hide);
+                if (hide && !InterlockedCompareExchange(&g_loggedHeadDraw, 1, 0))
+                    Log("head filter active: suppressed main-view part (material pass %d, flags %d)", pass, flags);
+            }
+            else if (g_cfg.debug && !g_loggedHeadShadow && IsCachedHeadPart(instance, part) &&
+                     !InterlockedCompareExchange(&g_loggedHeadShadow, 1, 0))
+                Log("head filter: retained head geometry in the native shadow pass");
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_headHideFailed = true;
+        Log("ERROR: head draw filter exception 0x%08lX; original rendering resumed", GetExceptionCode());
+    }
+    if (!hide) g_origDrawPart(instance, part, pass, flags);
+}
+
+static void __cdecl Hook_OutfitUpdate(uint8_t* player, const void* position, const void* orientation,
+                                     uint8_t* outfit, int visible)
+{
+    g_origOutfitUpdate(player, position, orientation, outfit, visible);
+    __try
+    {
+        if (!g_player || player != *g_player) return;
+        UpdateNearClip(InFirstPersonView(g_ctrl));
+        if (g_cfg.hideHead && !g_headHideFailed)
+            CacheLocalHead(visible ? outfit : NULL, player);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_headHideFailed = true;
+        Log("ERROR: head cache exception 0x%08lX; original rendering retained", GetExceptionCode());
+    }
+}
+
+static void InitHeadVisibility()
+{
+    if (!g_cfg.hideHead && !g_cfg.faceCamera) return;
+    uint8_t* update = Find("player outfit render update", kSigOutfitUpdate);
+    uint8_t* index = Find("mesh VID lookup", kSigVidIndex);
+    uint8_t* draw = Find("mesh part draw", kSigDrawPart);
+    uint8_t* view = Find("render view origin", kSigRenderView);
+    uint8_t* shadow = Find("shadow render pass", kSigShadowPass);
+    if (!update || !index || !draw || !view || !shadow || !g_cameraMode)
+    {
+        Log("ERROR: head visibility unavailable; no rendering hooks installed");
+        return;
+    }
+    g_renderTlsIndex = ReadPtr<const DWORD*>(view + 8);
+    g_renderContextOffset = *(const uint32_t*)(view + 17);
+    if (g_renderContextOffset != 0x674 && g_renderContextOffset != 0x270) return;
+    uint8_t* viewGetter = CallTarget(view + 29);
+    if (!viewGetter || memcmp(viewGetter, "\x8B\x41\x10\xC3", 4) != 0) return;
+    if (!InImage(g_renderTlsIndex, sizeof(DWORD))) return;
+    g_vidIndex = (VidIndexFn)index;
+    g_origOutfitUpdate = (OutfitUpdateFn)Detour(update, (const void*)&Hook_OutfitUpdate, 6);
+    if (g_origOutfitUpdate)
+        g_origShadowPass = (ShadowPassFn)Detour(shadow, (const void*)&Hook_ShadowPass, 5);
+    if (g_origOutfitUpdate && g_origShadowPass)
+        g_origDrawPart = (DrawPartFn)Detour(draw, (const void*)&Hook_DrawPart, 6);
+    Log("head visibility: %s", g_origDrawPart ? "all eye-view material/depth draws filtered; explicit shadow scope preserved" : "hook installation failed");
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -1497,6 +2040,31 @@ static void InitVehicleLook(const uint8_t* ctrlUpdate)
         return;
     }
     bool locked = InstallJump(lock, (const void*)&Hook_VehicleLock, kVehicleLockPatch);
+    uint8_t* inputGate = Find("aircraft flight-mode camera input gate", kSigAircraftLookInputGate);
+    if (inputGate)
+    {
+        uint8_t* predicate = CallTarget(inputGate + 10);
+        static const uint8_t expected[] = {0x8B,0x4C,0x24,0x04,0x85,0xC9,0x74,0x3E,
+            0x8B,0x81,0xF4,0x0B,0x00,0x00,0x8B,0x40,0x2C,0x83,0xF8,0x02};
+        if (InImage(predicate, sizeof expected) && memcmp(predicate, expected, sizeof expected) == 0)
+        {
+            g_origAircraftLookInputGate = (AircraftLookInputGateFn)predicate;
+            if (RedirectCall(inputGate + 10, (const void*)&Hook_AircraftLookInputGate))
+                Log("vehicle camera: flight-mode look-input gate patched for first person");
+            else Log("ERROR: aircraft look-input gate could not be patched");
+        }
+        else Log("ERROR: unexpected aircraft input predicate; original routing retained");
+    }
+    uint8_t* transition = Find("aircraft mode-change look", kSigVehicleTransitionLook);
+    if (transition)
+    {
+        g_origVehicleTransitionLook = (VehicleTransitionLookFn)CallTarget(transition + 9);
+        if (!InImage((void*)g_origVehicleTransitionLook, 6) ||
+            !RedirectCall(transition + 9, (const void*)&Hook_VehicleTransitionLook))
+            Log("ERROR: aircraft mode-change look could not be patched");
+        else
+            Log("vehicle camera: aircraft mode-change forced look disabled in first person");
+    }
     g_vehLookReady = true;
     Log("vehicle camera: no re-centring in first person (swing %p, lock %p%s, heading %p)", swing, lock,
         locked ? "" : " NOT patched", g_heading);
@@ -1504,6 +2072,13 @@ static void InitVehicleLook(const uint8_t* ctrlUpdate)
 
 static bool InitCamera()
 {
+    uint8_t* dispatch = Find("camera mode dispatcher", kSigCameraDispatch);
+    if (dispatch)
+    {
+        const int* mode = ReadPtr<const int*>(dispatch + 1);
+        if (InImage(mode, sizeof(int)))
+            g_cameraMode = mode;
+    }
     uint8_t* update = Find("camera controller update", kSigCtrlUpdate);
     uint8_t* tableRef = Find("submode table", kSigSubmodeTable);
     uint8_t* namesRef = Find("submode names", kSigSubmodeNames);
@@ -1573,6 +2148,8 @@ static bool InitCamera()
     Log("hooked camera controller %p and camera update call %p; submode table %p, camera %p, player %p, near clip %p",
         update, camCall, g_table, g_camPos, g_player, g_nearClip);
     InitVehicleLook(update);
+    InitHeadVisibility();
+    if (g_origDrawPart) InitFacing();
     return true;
 }
 
@@ -1638,6 +2215,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
             g_cfg.headUp, g_cfg.headForward,
             g_cfg.headSmoothing, g_cfg.eyeHeight, g_cfg.crouchEyeHeight, g_cfg.fov, g_cfg.sprintFov, g_cfg.aimFov,
             g_cfg.vehicleFov, g_cfg.lookUpLimit, g_cfg.lookDownLimit, g_cfg.nearClip, g_cfg.lodScale);
+        Log("look-down clearance %.2f m (on foot, fades in from 45 to 75 degrees)", g_cfg.lookDownForward);
         Init(GetModuleHandleA(NULL));
     }
     else if (reason == DLL_PROCESS_DETACH)

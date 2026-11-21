@@ -1,9 +1,7 @@
-# SRTT First Person
+# SRTT First Person 1.11
 
 A first-person camera for **Saints Row: The Third** (original 2011 PC release, DX9 and DX11), plus a
 level-of-detail distance multiplier. Press **L** in game to switch between first and third person.
-
-https://www.youtube.com/watch?v=_ErMo5DBjGA
 
 ## Install / uninstall
 
@@ -45,12 +43,14 @@ To rebuild: run `build.bat` in `SRTT_FirstPerson` (needs the Visual Studio C++ b
 | `VehicleFirstPerson` | `1` | `0` keeps the normal camera in vehicles |
 | `VehicleAutoCenter` | `0` | `1` keeps the game's swing back to face forward while driving in first person |
 | `AttachToHead` | `1` | Follow the character's animated head; `0` uses a fixed height above the feet |
-| `HeadUp`, `HeadForward` | `0.08`, `0.10` | Eye position relative to the head, in metres (forward = the way you look) |
+| `HideHead` | `1` | Hide the local player's head, eyes, hair and head accessories in first person; restore in third person |
+| `HeadUp`, `HeadForward` | `0.08`, `0.02` | Eye position relative to the head, in metres (forward = the way you look) |
+| `LookDownForward` | `0.20` | Extra forward clearance on foot, fading in from 45 to 75 degrees down; 0 disables it (max 0.40 m) |
 | `HeadSmoothing` | `0.08` | Damps head bob, in seconds; `0` turns it off |
 | `EyeHeight`, `CrouchEyeHeight` | `1.60`, `1.30` | Camera height above the feet when not following the head |
 | `FOV`, `SprintFOV`, `AimFOV`, `VehicleFOV` | `82.8`, `91.08`, `55.2`, `82.8` | Field of view in first person; `0` keeps the game's value |
 | `LookUpLimit`, `LookDownLimit` | `80`, `80` | Pitch limits in degrees; `0` keeps the game's (75 up, 55 down on foot) |
-| `NearClip` | `0.15` | Near clip distance in first person (the game's own value); raise it if bits of your head show |
+| `NearClip` | `0.03` | First-person near plane in metres (0.02 to 1); 0 keeps the game's value |
 | `LODScale` | `4` | Level-of-detail distance multiplier (0.25 to 16); `1` = the game's distances |
 | `Log`, `Debug` | `1`, `0` | Write `SRTT_FirstPerson.log`; `Debug=1` also logs the camera state every second |
 
@@ -60,6 +60,50 @@ Changes take effect the next time the game starts.
 
 Both game executables import `DirectInput8Create` from `dinput8.dll`, so Windows loads this proxy from the
 game folder first; it forwards everything to the real system `dinput8.dll`.
+
+### VTOL flight-mode look input and smoothing rollback (1.11)
+
+The arm/weapon stabilizer introduced in 1.10 has been removed, including its rendering hooks and
+`WeaponSmoothing` setting. Arms, weapons and body rendering use the previous native transforms.
+The original camera head-bob smoothing is retained. Player rotation remains disabled (`FaceCamera=0`).
+
+The previous pitch-limit repair did not address a separate input restriction: when mouse flight
+controls are enabled, the vehicle look-input callback returns early for airplanes and VTOL flight
+mode, discarding both look axes. This release bypasses that one predicate call only for the current
+first-person vehicle camera with `VehicleAutoCenter=0`. The native input processing, sensitivity,
+inversion and pitch integration then run normally. Flight physics and other aircraft classification
+calls are unchanged; third person, vehicle aiming and other camera targets keep their original routing.
+
+Tests reproduce the original rejection and execute the patched input route plus native pitch
+integration from both DX9 and DX11, including repeated hover/flight transitions, both pitch directions
+and inversion. This is offline verification; the full VTOL flight-mode view still needs an in-game check.
+
+### Aircraft hover/flight switching (1.9)
+
+With first-person vehicle free look enabled (`VehicleAutoCenter=0`), the aircraft mode-change
+forced-angle request is bypassed for the current vehicle. Other forced-look callers and third-person
+views keep their native behavior. Configured up/down limits are reapplied to the vehicle controller's
+cached pitch bounds after its update, so a mode switch cannot leave the view clamped in place.
+Setting either look limit to `0` still leaves that limit under game control. Vehicle aiming cameras
+retain their native weapon-camera bounds. Player-facing changes remain disabled in the supplied INI.
+
+Offline tests validate the call-site signature on DX9/DX11, controller resets across driver/alternate/
+helicopter/airplane modes, preservation of native values, and the forced-look bypass boundaries.
+Hover/flight switches in the Oppressor and VTOL still require visual testing in game.
+
+### Moving vehicle head visibility (1.8)
+
+Vehicle head filtering now accepts the current eye position and the immediately preceding eye
+position in the same vehicle camera mode. This addresses the movement-only failure where rendering
+can use a previous camera sample more than 15 cm from the latest update. Each sample retains the
+15 cm tolerance; positions between the samples are not treated as first person. History is discarded
+on camera mode/player changes, disabled first person, missing eye updates, or updates over 100 ms.
+Shadows still use the complete head. `FaceCamera=0` remains in the supplied configuration.
+
+The regression test drives the camera and draw hooks through five vehicle camera modes and five
+speeds, checking head/hair filtering, body/shadow retention, external views and history expiry.
+The new build needs an in-game driving/flying check. With `Debug=1`, the log reports the distance
+between each vehicle render view and the two eye samples once per second.
 
 ### Camera
 
@@ -86,6 +130,46 @@ skips both, and each frame turns the heading by however much the vehicle turned,
 game measures it for its own vehicle-relative camera. So the view keeps its angle to the vehicle until you
 move the mouse. Aiming out of a vehicle keeps the game's behaviour.
 
+### Animation visibility, shadows and body facing (1.7)
+
+Head hiding filters every mesh material/depth draw in the eye view. Shadow rendering is identified by
+an explicit, thread-local scope around the game's shadow render pass. This corrects the flat head/eye
+silhouettes in 1.6, whose filter incorrectly excluded some non-shadow depth draws. The shared model
+remains complete for shadows. Checking the render camera's actual world position restores the head
+when an animation camera pulls away, even if its free-camera submode is unchanged.
+
+`FaceCamera=1` (optional; shipped configuration uses `0`) selects the game's native view-relative facing and directional animation
+paths for the local player in normal on-foot first person. It enables the directional selector's
+existing left/right/backward angle thresholds and hysteresis. Movement vectors and speed remain
+under the game's control. The direct late-frame physics rotation from 1.6 has been removed; that
+method fought movement and left the animation controller selecting forward running.
+
+Vehicles, scripted camera modes and non-upright poses retain normal control. The native animation
+state machine still owns special moves and sprint animations. `FaceCamera=0` restores normal facing.
+The previous look-down neck clearance, weapon near plane and custom FOV settings are retained.
+
+Both DX9 and DX11 offline checks pass, including execution of the native directional selector and
+facing-offset calculations. In-game appearance, movement and animation transitions need visual testing.
+
+### Look-down neck clearance (1.5)
+
+With head hiding enabled, the camera moves up to 20 cm further forward horizontally as you look
+from 45 to 75 degrees down. This keeps the open neck behind the viewpoint without adding geometry.
+It follows your viewing direction, blends smoothly, and leaves level/upward views and vehicle cameras
+unchanged. `LookDownForward=0` disables it. It requires `AttachToHead=1` and `HideHead=1`.
+This is a view-position workaround: some outfits or downward weapon animations may still need tuning.
+
+### Head visibility and weapon clearance (1.4)
+
+Head/face VIDs 1 and 50�53 and head accessories are hidden only in the eye view. These are the
+body regions obscured by the game's full-face STAG helmet. VID-to-part mapping is resolved for the
+current mesh and LOD. Outfit data, skinning bones and game files are unchanged.
+
+The first-person near plane is now 3 cm instead of 15 cm, and the default forward eye offset is 2 cm
+instead of 10 cm, giving held weapons more clearance. The original near plane is restored when leaving
+first person. This reduces near-plane slicing; third-person reload/melee animations can still physically
+pass through the viewpoint. `NearClip=0.15` restores the previous depth precision if distant surfaces flicker.
+
 ### Level of detail
 
 The game has several separate LOD systems; `LODScale` multiplies each one's distances:
@@ -106,9 +190,23 @@ different game version), the mod writes the reason to `SRTT_FirstPerson.log` and
 
 ## Known limitations
 
-- Your own body is visible when you look down, and arms or weapons can pass close to the view during
+- Your own body is visible when you look down. Head geometry is hidden with `HideHead=1`; arms or weapons can still pass through the view during
   some animations. Vehicle interiors were never meant to be seen this close.
 - In first person the view turns with a vehicle's heading but not its pitch or roll, so in aircraft the
   horizon stays level (`VehicleAutoCenter=1` brings back the game's lock behind aircraft).
 - Large `LODScale` values cost frame rate, especially in dense areas.
 - Other mods that also ship a `dinput8.dll` (for example ASI loaders) conflict with this one.
+
+## Development checks
+
+`tests\run.bat` builds an x86 harness that executes real VID lookup from both installed executables
+against synthetic meshes with different LOD mappings. It checks all 48 tested material-pass/draw-flag
+combinations through the actual draw hook, shadow-scope restoration (including exceptions), animation
+camera restoration, local-player isolation, the assembly strafe hook, unchanged shared render data,
+near-plane ownership and look-down clearance.
+
+`tests/native_locomotion.py` emulates the native facing-offset calculation and directional-animation
+selector from each executable for four movement directions at four camera headings. It verifies the
+left/right/backward animation flags and that requested movement direction/speed are unchanged. This
+uses `pefile` and `unicorn` from `.tools`. These checks do not run a complete game frame or replace
+visual testing of weapons, outfits and animation transitions in game.
